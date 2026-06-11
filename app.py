@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse, parse_qs
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
+DATA_DIR = Path(os.environ.get("DATA_DIR") or ("/tmp/cabinet-election-data" if os.environ.get("VERCEL") else ROOT / "data"))
 DATA_DIR.mkdir(exist_ok=True)
 CANDIDATES_FILE = DATA_DIR / "candidates.json"
 VOTES_FILE = DATA_DIR / "votes.json"
@@ -52,7 +52,7 @@ def save_json(file_path, data):
 sessions = set()
 
 def send_discord_webhook(voter_name, section, role_no, election_scope, votes_dict):
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_CABINET") or os.environ.get("DISCORD_WEBHOOK_URL")
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
     if not webhook_url:
         return
 
@@ -270,7 +270,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             }
             save_json(VOTES_FILE, votes_ledger)
             
-            if os.environ.get("DISCORD_WEBHOOK_CABINET") or os.environ.get("DISCORD_WEBHOOK_URL"):
+            if os.environ.get("DISCORD_WEBHOOK_URL"):
                 threading.Thread(
                     target=send_discord_webhook,
                     args=(voter_name, section, role_no, election_scope, v_votes),
