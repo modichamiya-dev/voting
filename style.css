@@ -801,6 +801,27 @@ body {
 .admin-house-tab-btn.active.yellow { background: var(--house-yellow-bg); color: var(--house-yellow); border: 1px solid rgba(255,184,0,0.2); }
 .admin-house-tab-btn.active.red    { background: var(--house-red-bg); color: var(--house-red); border: 1px solid rgba(255,77,77,0.2); }
 
+.admin-list-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 22px;
+}
+.nominee-transfer-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.compact-action {
+  padding: 8px 14px;
+  font-size: 12px;
+  min-height: 36px;
+  white-space: nowrap;
+}
+
 .admin-nominee-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
@@ -1464,7 +1485,8 @@ body {
   animation: slideInRight 0.4s 0.1s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 .admin-card {
-  transition: box-shadow 0.3s;
+  animation: fadeUp 0.42s cubic-bezier(0.16, 1, 0.3, 1) both;
+  transition: box-shadow 0.3s, transform 0.3s;
 }
 .admin-card:hover {
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
@@ -1489,6 +1511,8 @@ body {
 /* ─── ADMIN NOMINEE CARDS ─── */
 .admin-nominee-card {
   transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  animation: fadeUp 0.42s cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: var(--delay, 0ms);
 }
 .admin-nominee-card:hover {
   transform: translateY(-3px);
@@ -1911,4 +1935,154 @@ body {
 .crop-actions .btn-secondary {
   padding: 10px 24px;
   font-size: 14px;
+}
+
+/* Audit integrity panel */
+.integrity-panel {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  padding: 16px;
+  margin-bottom: 24px;
+}
+.integrity-panel.ok {
+  border-color: rgba(0, 230, 153, 0.24);
+  background: rgba(0, 230, 153, 0.05);
+}
+.integrity-panel.bad {
+  border-color: rgba(255, 77, 77, 0.28);
+  background: rgba(255, 77, 77, 0.06);
+}
+.integrity-panel.pending {
+  border-color: rgba(255, 184, 0, 0.24);
+  background: rgba(255, 184, 0, 0.05);
+}
+.integrity-status-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--warning);
+  box-shadow: 0 0 12px rgba(255, 184, 0, 0.35);
+}
+.integrity-panel.ok .integrity-status-dot {
+  background: var(--success);
+  box-shadow: 0 0 12px rgba(0, 230, 153, 0.35);
+}
+.integrity-panel.bad .integrity-status-dot {
+  background: var(--house-red);
+  box-shadow: 0 0 12px rgba(255, 77, 77, 0.35);
+}
+.integrity-copy {
+  min-width: 180px;
+  flex: 1;
+}
+.integrity-title {
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 700;
+}
+.integrity-sub {
+  color: var(--text-secondary);
+  font-size: 13px;
+  margin-top: 2px;
+}
+.integrity-hashes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+.integrity-hashes div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 110px;
+}
+.integrity-hashes span {
+  color: var(--text-muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+}
+.integrity-hashes strong,
+.integrity-hashes code {
+  color: var(--text-primary);
+  font-family: var(--font-display);
+  font-size: 12px;
+}
+.audit-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.audit-toolbar-status {
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.audit-toolbar-status.ok {
+  color: var(--success);
+  background: rgba(0, 230, 153, 0.06);
+  border-color: rgba(0, 230, 153, 0.22);
+}
+.audit-toolbar-status.bad {
+  color: var(--house-red);
+  background: rgba(255, 77, 77, 0.06);
+  border-color: rgba(255, 77, 77, 0.22);
+}
+.audit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.audit-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  padding: 14px 16px;
+}
+.audit-entry-title {
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.audit-entry-sub {
+  color: var(--text-secondary);
+  font-size: 12px;
+  margin-top: 2px;
+}
+.audit-entry-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.audit-entry-meta code {
+  color: var(--accent-color);
+  font-family: var(--font-display);
+}
+
+@media (max-width: 768px) {
+  .integrity-panel,
+  .audit-entry {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .integrity-hashes,
+  .audit-entry-meta {
+    justify-content: flex-start;
+  }
 }
