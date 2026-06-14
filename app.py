@@ -3,6 +3,7 @@ import json
 import uuid
 import secrets
 import threading
+import hashlib
 import urllib.request
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -14,6 +15,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR") or ("/tmp/cabinet-election-data" if o
 DATA_DIR.mkdir(exist_ok=True)
 CANDIDATES_FILE = DATA_DIR / "candidates.json"
 VOTES_FILE = DATA_DIR / "votes.json"
+AUDIT_LOG_FILE = DATA_DIR / "audit_log.jsonl"
 
 def load_env():
     env_path = ROOT / ".env"
@@ -48,6 +50,143 @@ def load_json(file_path, default):
 def save_json(file_path, data):
     with open(file_path, "w") as f:
         json.dump(data, f, indent=2)
+
+def canonical_json(data):
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+def sha256_text(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+def compute_results_hash(candidates=None, votes=None):
+    candidates = candidates if candidates is not None else load_json(CANDIDATES_FILE, {})
+    votes = votes if votes is not None else load_json(VOTES_FILE, {})
+    return sha256_text(canonical_json({
+        "candidates": candidates,
+        "votes": votes
+    }))
+
+def normalize_imported_candidates(raw_candidates):
+    if isinstance(raw_candidates, dict):
+        incoming = list(raw_candidates.values())
+    elif isinstance(raw_candidates, list):
+        incoming = raw_candidates
+    else:
+        raise ValueError("Nominee list must be an object or array.")
+
+    allowed_roles = {
+        "head_boy",
+        "head_girl",
+        "assistant_head_boy",
+        "assistant_head_girl",
+        "sports_captain_boy",
+        "sports_captain_girl",
+        "cultural_secretary_boy",
+        "cultural_secretary_girl"
+    }
+    normalized = {}
+
+    for item in incoming:
+        if not isinstance(item, dict):
+            continue
+
+        name = str(item.get("name", "")).strip()
+        role = str(item.get("role", "")).strip()
+        if not name or role not in allowed_roles:
+            continue
+
+        c_id = str(item.get("id", "")).strip()
+        if not c_id or c_id in normalized:
+            c_id = f"c_{secrets.token_hex(8)}"
+
+        photo = item.get("photo", None)
+        if photo is not None and not isinstance(photo, str):
+            photo = None
+
+        normalized[c_id] = {
+            "id": c_id,
+            "name": name,
+            "roleNo": str(item.get("roleNo", "") or ""),
+            "role": role,
+            "house": str(item.get("house", "cabinet") or "cabinet"),
+            "photo": photo
+        }
+
+    if not normalized:
+        raise ValueError("No valid nominees found in file.")
+
+    return normalized
+
+def read_audit_entries():
+    if not AUDIT_LOG_FILE.exists():
+        return []
+    entries = []
+    with open(AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+    return entries
+
+def audit_entry_hash(entry):
+    unsigned = dict(entry)
+    unsigned.pop("hash", None)
+    return sha256_text(canonical_json(unsigned))
+
+def append_audit_event(action, actor="system", details=None, candidates=None, votes=None):
+    entries = read_audit_entries()
+    prev_hash = entries[-1]["hash"] if entries else "GENESIS"
+    entry = {
+        "index": len(entries) + 1,
+        "timestamp": datetime.now().isoformat() + "Z",
+        "action": action,
+        "actor": actor,
+        "details": details or {},
+        "resultsHash": compute_results_hash(candidates, votes),
+        "prevHash": prev_hash
+    }
+    entry["hash"] = audit_entry_hash(entry)
+    with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(canonical_json(entry) + "\n")
+    return entry
+
+def verify_audit_log():
+    if not AUDIT_LOG_FILE.exists():
+        return {
+            "valid": True,
+            "entries": [],
+            "entryCount": 0,
+            "lastHash": None,
+            "message": "No audit events recorded yet."
+        }
+
+    entries = []
+    prev_hash = "GENESIS"
+    try:
+        with open(AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
+            for expected_index, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                entries.append(entry)
+                if entry.get("index") != expected_index:
+                    return {"valid": False, "entries": entries, "entryCount": len(entries), "lastHash": None, "message": f"Broken audit index at entry {expected_index}."}
+                if entry.get("prevHash") != prev_hash:
+                    return {"valid": False, "entries": entries, "entryCount": len(entries), "lastHash": None, "message": f"Broken hash link at entry {expected_index}."}
+                if entry.get("hash") != audit_entry_hash(entry):
+                    return {"valid": False, "entries": entries, "entryCount": len(entries), "lastHash": None, "message": f"Entry {expected_index} hash does not match its contents."}
+                prev_hash = entry["hash"]
+    except Exception as exc:
+        return {"valid": False, "entries": entries, "entryCount": len(entries), "lastHash": None, "message": f"Audit log cannot be parsed: {exc}"}
+
+    return {
+        "valid": True,
+        "entries": entries,
+        "entryCount": len(entries),
+        "lastHash": entries[-1]["hash"] if entries else None,
+        "message": "Audit chain verified."
+    }
 
 sessions = set()
 
@@ -206,9 +345,40 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             votes = load_json(VOTES_FILE, {})
             candidates = load_json(CANDIDATES_FILE, {})
+            audit = verify_audit_log()
+            current_results_hash = compute_results_hash(candidates, votes)
+            last_results_hash = audit["entries"][-1].get("resultsHash") if audit["entries"] else current_results_hash
             self.send_json({
                 "votes": votes,
-                "candidates": candidates
+                "candidates": candidates,
+                "integrity": {
+                    "auditValid": audit["valid"],
+                    "resultsValid": audit["valid"] and current_results_hash == last_results_hash,
+                    "currentResultsHash": current_results_hash,
+                    "lastLoggedResultsHash": last_results_hash,
+                    "lastAuditHash": audit["lastHash"],
+                    "auditEntryCount": audit["entryCount"],
+                    "message": audit["message"] if audit["valid"] else audit["message"]
+                }
+            })
+            return
+
+        if path == "/api/admin/audit":
+            if not self.check_admin_auth():
+                self.send_error_json("Unauthorized", 401)
+                return
+            audit = verify_audit_log()
+            current_results_hash = compute_results_hash()
+            last_results_hash = audit["entries"][-1].get("resultsHash") if audit["entries"] else current_results_hash
+            self.send_json({
+                "valid": audit["valid"],
+                "resultsValid": audit["valid"] and current_results_hash == last_results_hash,
+                "message": audit["message"],
+                "entryCount": audit["entryCount"],
+                "lastHash": audit["lastHash"],
+                "currentResultsHash": current_results_hash,
+                "lastLoggedResultsHash": last_results_hash,
+                "entries": audit["entries"][-100:]
             })
             return
 
@@ -257,10 +427,13 @@ class AppHandler(SimpleHTTPRequestHandler):
             
             votes_ledger = load_json(VOTES_FILE, {})
             if voter_id in votes_ledger:
+                append_audit_event("duplicate_vote_blocked", "voter", {
+                    "voterId": voter_id
+                }, votes=votes_ledger)
                 self.send_error_json("This Roll No. has already voted.", 403)
                 return
 
-            votes_ledger[voter_id] = {
+            vote_record = {
                 "voterName": voter_name,
                 "house": election_scope,
                 "section": section,
@@ -268,7 +441,12 @@ class AppHandler(SimpleHTTPRequestHandler):
                 "votes": v_votes,
                 "timestamp": int(uuid.uuid1().time / 10)
             }
+            votes_ledger[voter_id] = vote_record
             save_json(VOTES_FILE, votes_ledger)
+            append_audit_event("vote_submitted", "voter", {
+                "voterId": voter_id,
+                "ballotHash": sha256_text(canonical_json(vote_record))
+            }, votes=votes_ledger)
             
             if os.environ.get("DISCORD_WEBHOOK_URL"):
                 threading.Thread(
@@ -285,9 +463,11 @@ class AppHandler(SimpleHTTPRequestHandler):
             if password == ADMIN_PASSWORD:
                 token = secrets.token_hex(32)
                 sessions.add(token)
+                append_audit_event("admin_login_success", "admin", {})
                 self.send_json({"token": token, "adminPath": ADMIN_PATH})
                 return
             else:
+                append_audit_event("admin_login_failed", "admin", {})
                 self.send_error_json("Incorrect password", 401)
                 return
 
@@ -316,6 +496,11 @@ class AppHandler(SimpleHTTPRequestHandler):
                 "photo": photo
             }
             save_json(CANDIDATES_FILE, candidates)
+            append_audit_event("candidate_added", "admin", {
+                "candidateId": c_id,
+                "role": role,
+                "nameHash": sha256_text(name)
+            }, candidates=candidates)
             self.send_json({"success": True, "id": c_id})
             return
 
@@ -323,21 +508,45 @@ class AppHandler(SimpleHTTPRequestHandler):
             c_id = data.get("id", "")
             candidates = load_json(CANDIDATES_FILE, {})
             if c_id in candidates:
+                removed = candidates[c_id]
                 del candidates[c_id]
                 save_json(CANDIDATES_FILE, candidates)
+                append_audit_event("candidate_deleted", "admin", {
+                    "candidateId": c_id,
+                    "role": removed.get("role"),
+                    "nameHash": sha256_text(removed.get("name", ""))
+                }, candidates=candidates)
                 self.send_json({"success": True})
             else:
                 self.send_error_json("Candidate not found", 404)
             return
 
+        if path == "/api/admin/candidates/import":
+            raw_candidates = data.get("candidates", data.get("nominees", data))
+            try:
+                candidates = normalize_imported_candidates(raw_candidates)
+            except ValueError as exc:
+                self.send_error_json(str(exc), 400)
+                return
+
+            save_json(CANDIDATES_FILE, candidates)
+            append_audit_event("candidates_imported", "admin", {
+                "candidateCount": len(candidates),
+                "candidateIdsHash": sha256_text(canonical_json(sorted(candidates.keys())))
+            }, candidates=candidates)
+            self.send_json({"success": True, "count": len(candidates), "candidates": candidates})
+            return
+
         if path == "/api/admin/reset-votes":
             save_json(VOTES_FILE, {})
+            append_audit_event("votes_reset", "admin", {}, votes={})
             self.send_json({"success": True})
             return
 
         if path == "/api/admin/reset-all":
             save_json(CANDIDATES_FILE, {})
             save_json(VOTES_FILE, {})
+            append_audit_event("system_reset", "admin", {}, candidates={}, votes={})
             self.send_json({"success": True})
             return
 
