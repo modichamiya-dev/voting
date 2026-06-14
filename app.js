@@ -21,9 +21,11 @@ let state = {
   adminLoggedIn: !!sessionStorage.getItem('hce_token'),
   adminToken: sessionStorage.getItem('hce_token') || '',
   adminPath: localStorage.getItem('hce_admin_path') || '/admin-portal-2026',
-  adminActiveView: 'add', // add | list | results | danger
+  adminActiveView: 'add', // add | list | results | audit | danger
   candidates: {},
   voteLedger: {},
+  integrity: null,
+  auditLog: null,
   currentVoterId: null,
 };
 
@@ -62,6 +64,7 @@ async function fetchResults() {
     const data = await apiCall('/api/admin/results', 'GET', null, true);
     state.voteLedger = data.votes;
     state.candidates = data.candidates;
+    state.integrity = data.integrity || null;
     render();
   } catch (err) {
     if (err.message === 'Unauthorized') {
@@ -73,6 +76,14 @@ async function fetchResults() {
       render();
     }
   }
+}
+
+async function fetchAuditLog() {
+  try {
+    const data = await apiCall('/api/admin/audit', 'GET', null, true);
+    state.auditLog = data;
+    render();
+  } catch (err) {}
 }
 
 // ─── RENDER ───────────────────────────────────────────────
@@ -511,6 +522,9 @@ function buildAdmin() {
       <button class="sidebar-btn ${state.adminActiveView === 'results' ? 'active' : ''}" onclick="setAdminView('results')">
         <span class="btn-icon">📊</span> View Results
       </button>
+      <button class="sidebar-btn ${state.adminActiveView === 'audit' ? 'active' : ''}" onclick="setAdminView('audit')">
+        <span class="btn-icon">#</span> Audit Log
+      </button>
       <button class="sidebar-btn ${state.adminActiveView === 'danger' ? 'active' : ''}" onclick="setAdminView('danger')">
         <span class="btn-icon">⚠️</span> Danger Zone
       </button>
@@ -530,6 +544,8 @@ function setAdminView(view) {
   state.adminActiveView = view;
   if (['list', 'results'].includes(view)) {
     fetchResults();
+  } else if (view === 'audit') {
+    fetchAuditLog();
   } else {
     render();
   }
@@ -589,16 +605,25 @@ function buildAdminContent() {
   if (state.adminActiveView === 'list') {
     return `
     <div class="admin-card">
-      <div class="admin-card-title">Nominees Directory</div>
-      <div class="admin-card-desc">Review all cabinet nominees by category.</div>
+      <div class="admin-list-header">
+        <div>
+          <div class="admin-card-title">Nominees Directory</div>
+          <div class="admin-card-desc">Review all cabinet nominees by category.</div>
+        </div>
+        <div class="nominee-transfer-actions">
+          <button class="btn-secondary compact-action" onclick="exportNominees()">Export JSON</button>
+          <button class="btn-primary compact-action" onclick="openNomineeImport()">Import JSON</button>
+          <input type="file" id="nominee-import-input" accept="application/json,.json" onchange="importNominees(event)" hidden />
+        </div>
+      </div>
 
       ${nominees.length === 0
         ? `<div class="empty-state"><div class="empty-state-icon">👤</div>No nominees added yet.</div>`
         : `<div class="admin-nominee-grid">
-            ${nominees.map(c => {
+            ${nominees.map((c, index) => {
               const role = ROLES.find(r => r.id === c.role);
               return `
-              <div class="admin-nominee-card">
+              <div class="admin-nominee-card" style="--delay:${Math.min(index * 45, 450)}ms">
                 <div class="admin-nominee-photo">
                   ${c.photo ? `<img src="${c.photo}" alt="${esc(c.name)}" />` : genderEmoji(role?.gender || 'boy')}
                 </div>
@@ -625,8 +650,13 @@ function buildAdminContent() {
           <button class="btn-secondary" style="padding: 8px 16px; font-size: 13px;" onclick="exportToPDF()">Export PDF</button>
         </div>
       </div>
+      ${buildIntegrityPanel(state.integrity)}
       ${buildResultsInner()}
     </div>`;
+  }
+
+  if (state.adminActiveView === 'audit') {
+    return buildAuditLog();
   }
 
   if (state.adminActiveView === 'danger') {
@@ -652,6 +682,81 @@ function buildAdminContent() {
       </div>
     </div>`;
   }
+}
+
+function buildIntegrityPanel(integrity) {
+  if (!integrity) {
+    return `
+    <div class="integrity-panel pending">
+      <div class="integrity-status-dot"></div>
+      <div>
+        <div class="integrity-title">Integrity not loaded</div>
+        <div class="integrity-sub">Refresh results to verify the audit chain.</div>
+      </div>
+    </div>`;
+  }
+
+  const ok = integrity.auditValid && integrity.resultsValid;
+  return `
+  <div class="integrity-panel ${ok ? 'ok' : 'bad'}">
+    <div class="integrity-status-dot"></div>
+    <div class="integrity-copy">
+      <div class="integrity-title">${ok ? 'Results verified' : 'Integrity warning'}</div>
+      <div class="integrity-sub">${esc(integrity.message || '')}</div>
+    </div>
+    <div class="integrity-hashes">
+      <div><span>Entries</span><strong>${integrity.auditEntryCount || 0}</strong></div>
+      <div><span>Result hash</span><code>${shortHash(integrity.currentResultsHash)}</code></div>
+      <div><span>Audit hash</span><code>${shortHash(integrity.lastAuditHash)}</code></div>
+    </div>
+  </div>`;
+}
+
+function buildAuditLog() {
+  const audit = state.auditLog;
+  if (!audit) {
+    return `
+    <div class="admin-card">
+      <div class="admin-card-title">Audit Log</div>
+      <div class="admin-card-desc">Loading audit chain verification...</div>
+    </div>`;
+  }
+
+  const ok = audit.valid && audit.resultsValid;
+  const entries = [...(audit.entries || [])].reverse();
+  return `
+  <div class="admin-card">
+    <div class="admin-card-title">Audit Log</div>
+    <div class="admin-card-desc" style="margin-bottom: 20px;">Hash-chained record of votes, admin access, nominee changes, and resets.</div>
+    ${buildIntegrityPanel({
+      auditValid: audit.valid,
+      resultsValid: audit.resultsValid,
+      message: audit.message,
+      auditEntryCount: audit.entryCount,
+      currentResultsHash: audit.currentResultsHash,
+      lastAuditHash: audit.lastHash
+    })}
+    <div class="audit-toolbar">
+      <button class="btn-secondary" onclick="fetchAuditLog()">Verify Again</button>
+      <div class="audit-toolbar-status ${ok ? 'ok' : 'bad'}">${ok ? 'Chain intact' : 'Review required'}</div>
+    </div>
+    ${entries.length === 0
+      ? `<div class="empty-state"><div class="empty-state-icon">#</div>No audit events recorded yet.</div>`
+      : `<div class="audit-list">
+          ${entries.map(entry => `
+          <div class="audit-entry">
+            <div class="audit-entry-main">
+              <div class="audit-entry-title">${esc(formatAuditAction(entry.action))}</div>
+              <div class="audit-entry-sub">${esc(formatAuditDetails(entry))}</div>
+            </div>
+            <div class="audit-entry-meta">
+              <span>#${entry.index}</span>
+              <code>${shortHash(entry.hash)}</code>
+              <span>${esc(formatDateTime(entry.timestamp))}</span>
+            </div>
+          </div>`).join('')}
+        </div>`}
+  </div>`;
 }
 
 let pendingPhotoData = null;
@@ -900,6 +1005,65 @@ async function deleteCandidate(id) {
   } catch (err) {}
 }
 
+function exportNominees() {
+  const nominees = Object.values(state.candidates || {});
+  const payload = {
+    type: 'cabinet-election-nominees',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    count: nominees.length,
+    candidates: state.candidates || {}
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `nominee_list_${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+  showToast(`Exported ${nominees.length} nominee${nominees.length === 1 ? '' : 's'}`, 'success');
+}
+
+function openNomineeImport() {
+  const input = document.getElementById('nominee-import-input');
+  if (input) input.click();
+}
+
+async function importNominees(event) {
+  const input = event.target;
+  const file = input.files && input.files[0];
+  if (!file) return;
+
+  try {
+    const text = await file.text();
+    const parsed = JSON.parse(text);
+    const candidates = parsed.candidates || parsed.nominees || parsed;
+    const importCount = Array.isArray(candidates)
+      ? candidates.length
+      : Object.keys(candidates || {}).length;
+
+    if (!importCount) {
+      showToast('No nominees found in that file', 'error');
+      return;
+    }
+
+    if (!confirm(`Import ${importCount} nominee${importCount === 1 ? '' : 's'}? This will replace the current nominee list.`)) {
+      return;
+    }
+
+    const res = await apiCall('/api/admin/candidates/import', 'POST', { candidates }, true);
+    state.candidates = res.candidates || {};
+    showToast(`Imported ${res.count || importCount} nominee${(res.count || importCount) === 1 ? '' : 's'}`, 'success');
+    fetchResults();
+  } catch (err) {
+    showToast(err.message || 'Could not import nominee file', 'error');
+  } finally {
+    input.value = '';
+  }
+}
+
 async function resetVotes() {
   if (!confirm('Reset ALL votes? This cannot be undone.')) return;
   try {
@@ -1091,6 +1255,28 @@ function cap(str) {
 }
 function genderEmoji(gender) {
   return gender === 'girl' ? '👧' : '👦';
+}
+function shortHash(hash) {
+  if (!hash) return 'none';
+  return `${hash.slice(0, 10)}...${hash.slice(-6)}`;
+}
+function formatAuditAction(action) {
+  return String(action || '').split('_').map(cap).join(' ');
+}
+function formatDateTime(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+function formatAuditDetails(entry) {
+  const details = entry.details || {};
+  const bits = [];
+  if (entry.actor) bits.push(`Actor: ${entry.actor}`);
+  if (details.voterId) bits.push(`Voter: ${details.voterId}`);
+  if (details.candidateId) bits.push(`Candidate: ${details.candidateId}`);
+  if (details.role) bits.push(`Role: ${details.role}`);
+  if (details.ballotHash) bits.push(`Ballot: ${shortHash(details.ballotHash)}`);
+  return bits.join(' · ') || 'No extra details';
 }
 
 // ─── ROUTER & INIT ────────────────────────────────────────
