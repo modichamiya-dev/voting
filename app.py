@@ -11,11 +11,6 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse, parse_qs
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("DATA_DIR") or ("/tmp/cabinet-election-data" if os.environ.get("VERCEL") else ROOT / "data"))
-DATA_DIR.mkdir(exist_ok=True)
-CANDIDATES_FILE = DATA_DIR / "candidates.json"
-VOTES_FILE = DATA_DIR / "votes.json"
-AUDIT_LOG_FILE = DATA_DIR / "audit_log.jsonl"
 
 def load_env():
     env_path = ROOT / ".env"
@@ -33,10 +28,103 @@ def load_env():
 
 load_env()
 
+DATA_DIR = Path(os.environ.get("DATA_DIR") or ("/tmp/cabinet-election-data" if os.environ.get("VERCEL") else ROOT / "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+CANDIDATES_FILE = DATA_DIR / "candidates.json"
+VOTES_FILE = DATA_DIR / "votes.json"
+AUDIT_LOG_FILE = DATA_DIR / "audit_log.jsonl"
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD") or ""
 ADMIN_PATH = os.environ.get("ADMIN_PATH") or "/admin-portal-2026"
 
+REDIS_JSON_KEYS = {
+    "candidates.json": "candidates",
+    "votes.json": "votes",
+    "audit_log.jsonl": "audit_log"
+}
+REDIS_KEY_PREFIX = os.environ.get("REDIS_KEY_PREFIX") or os.environ.get("STORAGE_KEY_PREFIX") or "cabinet-election"
+
+def redis_url():
+    return (
+        os.environ.get("REDIS_URL")
+        or os.environ.get("STORAGE_URL")
+        or os.environ.get("KV_URL")
+        or os.environ.get("UPSTASH_REDIS_URL")
+    )
+
+def redis_rest_config():
+    url = (
+        os.environ.get("UPSTASH_REDIS_REST_URL")
+        or os.environ.get("KV_REST_API_URL")
+        or os.environ.get("STORAGE_REST_API_URL")
+    )
+    token = (
+        os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+        or os.environ.get("KV_REST_API_TOKEN")
+        or os.environ.get("STORAGE_REST_API_TOKEN")
+    )
+    return url, token
+
+class RedisStore:
+    def __init__(self):
+        self.client = None
+        self.rest_url, self.rest_token = redis_rest_config()
+        url = redis_url()
+        if url:
+            try:
+                import redis
+            except ImportError as exc:
+                raise RuntimeError("Redis URL found, but the redis Python package is not installed.") from exc
+            self.client = redis.Redis.from_url(url, decode_responses=True)
+
+    @property
+    def enabled(self):
+        return bool(self.client or (self.rest_url and self.rest_token))
+
+    def key(self, file_path):
+        suffix = REDIS_JSON_KEYS.get(Path(file_path).name, Path(file_path).name)
+        return f"{REDIS_KEY_PREFIX}:{suffix}"
+
+    def get_text(self, key):
+        if self.client:
+            return self.client.get(key)
+        return self.rest_command("GET", key)
+
+    def set_text(self, key, value):
+        if self.client:
+            self.client.set(key, value)
+            return
+        self.rest_command("SET", key, value)
+
+    def rest_command(self, *parts):
+        payload = json.dumps(list(parts)).encode("utf-8")
+        req = urllib.request.Request(
+            self.rest_url,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {self.rest_token}",
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=8) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        if "error" in body and body["error"]:
+            raise RuntimeError(f"Redis error: {body['error']}")
+        return body.get("result")
+
+REDIS_STORE = RedisStore()
+
 def load_json(file_path, default):
+    if REDIS_STORE.enabled:
+        raw = REDIS_STORE.get_text(REDIS_STORE.key(file_path))
+        if raw in (None, ""):
+            REDIS_STORE.set_text(REDIS_STORE.key(file_path), json.dumps(default))
+            return default
+        try:
+            return json.loads(raw)
+        except Exception:
+            return default
+
     if not file_path.exists():
         with open(file_path, "w") as f:
             json.dump(default, f)
@@ -48,6 +136,10 @@ def load_json(file_path, default):
         return default
 
 def save_json(file_path, data):
+    if REDIS_STORE.enabled:
+        REDIS_STORE.set_text(REDIS_STORE.key(file_path), json.dumps(data, indent=2))
+        return
+
     with open(file_path, "w") as f:
         json.dump(data, f, indent=2)
 
@@ -117,6 +209,17 @@ def normalize_imported_candidates(raw_candidates):
     return normalized
 
 def read_audit_entries():
+    if REDIS_STORE.enabled:
+        raw = REDIS_STORE.get_text(REDIS_STORE.key(AUDIT_LOG_FILE))
+        if not raw:
+            return []
+        entries = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+        return entries
+
     if not AUDIT_LOG_FILE.exists():
         return []
     entries = []
@@ -146,11 +249,37 @@ def append_audit_event(action, actor="system", details=None, candidates=None, vo
         "prevHash": prev_hash
     }
     entry["hash"] = audit_entry_hash(entry)
+    if REDIS_STORE.enabled:
+        audit_key = REDIS_STORE.key(AUDIT_LOG_FILE)
+        current = REDIS_STORE.get_text(audit_key) or ""
+        REDIS_STORE.set_text(audit_key, current + canonical_json(entry) + "\n")
+        return entry
+
     with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
         f.write(canonical_json(entry) + "\n")
     return entry
 
 def verify_audit_log():
+    if REDIS_STORE.enabled:
+        entries = read_audit_entries()
+        prev_hash = "GENESIS"
+        for expected_index, entry in enumerate(entries, start=1):
+            if entry.get("index") != expected_index:
+                return {"valid": False, "entries": entries, "entryCount": len(entries), "lastHash": None, "message": f"Broken audit index at entry {expected_index}."}
+            if entry.get("prevHash") != prev_hash:
+                return {"valid": False, "entries": entries, "entryCount": len(entries), "lastHash": None, "message": f"Broken hash link at entry {expected_index}."}
+            if entry.get("hash") != audit_entry_hash(entry):
+                return {"valid": False, "entries": entries, "entryCount": len(entries), "lastHash": None, "message": f"Entry {expected_index} hash does not match its contents."}
+            prev_hash = entry["hash"]
+
+        return {
+            "valid": True,
+            "entries": entries,
+            "entryCount": len(entries),
+            "lastHash": entries[-1]["hash"] if entries else None,
+            "message": "Audit chain verified."
+        }
+
     if not AUDIT_LOG_FILE.exists():
         return {
             "valid": True,
