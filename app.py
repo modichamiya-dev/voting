@@ -172,6 +172,8 @@ def normalize_imported_candidates(raw_candidates):
         "assistant_head_girl",
         "sports_captain_boy",
         "sports_captain_girl",
+        "vice_sports_captain_boy",
+        "vice_sports_captain_girl",
         "cultural_secretary_boy",
         "cultural_secretary_girl"
     }
@@ -334,6 +336,8 @@ def send_discord_webhook(voter_name, section, role_no, election_scope, votes_dic
         "assistant_head_girl": "Assistant Head Girl",
         "sports_captain_boy": "Sports Captain Boy",
         "sports_captain_girl": "Sports Captain Girl",
+        "vice_sports_captain_boy": "Vice Sports Captain Boy",
+        "vice_sports_captain_girl": "Vice Sports Captain Girl",
         "cultural_secretary_boy": "Cultural Secretary Boy",
         "cultural_secretary_girl": "Cultural Secretary Girl"
     }
@@ -358,6 +362,8 @@ def send_discord_webhook(voter_name, section, role_no, election_scope, votes_dic
         ("assistant_head_girl", "Assistant Head Girl"),
         ("sports_captain_boy", "Sports Captain Boy"),
         ("sports_captain_girl", "Sports Captain Girl"),
+        ("vice_sports_captain_boy", "Vice Sports Captain Boy"),
+        ("vice_sports_captain_girl", "Vice Sports Captain Girl"),
         ("cultural_secretary_boy", "Cultural Secretary Boy"),
         ("cultural_secretary_girl", "Cultural Secretary Girl")
     ]
