@@ -5,6 +5,7 @@ import secrets
 import threading
 import hashlib
 import urllib.request
+import time
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -42,6 +43,7 @@ REDIS_JSON_KEYS = {
     "audit_log.jsonl": "audit_log"
 }
 REDIS_KEY_PREFIX = os.environ.get("REDIS_KEY_PREFIX") or os.environ.get("STORAGE_KEY_PREFIX") or "cabinet-election"
+REDIS_AUDIT_LIST_SUFFIX = "audit_log_entries"
 
 def redis_url():
     return (
@@ -84,6 +86,21 @@ class RedisStore:
         suffix = REDIS_JSON_KEYS.get(Path(file_path).name, Path(file_path).name)
         return f"{REDIS_KEY_PREFIX}:{suffix}"
 
+    def vote_key(self, voter_id):
+        return f"{REDIS_KEY_PREFIX}:vote:{voter_id}"
+
+    def vote_pattern(self):
+        return f"{REDIS_KEY_PREFIX}:vote:*"
+
+    def audit_list_key(self):
+        return f"{REDIS_KEY_PREFIX}:{REDIS_AUDIT_LIST_SUFFIX}"
+
+    def audit_index_key(self):
+        return f"{REDIS_KEY_PREFIX}:audit_index"
+
+    def audit_hash_key(self):
+        return f"{REDIS_KEY_PREFIX}:audit_last_hash"
+
     def get_text(self, key):
         if self.client:
             return self.client.get(key)
@@ -94,6 +111,104 @@ class RedisStore:
             self.client.set(key, value)
             return
         self.rest_command("SET", key, value)
+
+    def set_text_nx(self, key, value):
+        if self.client:
+            return bool(self.client.set(key, value, nx=True))
+        return self.rest_command("SET", key, value, "NX") == "OK"
+
+    def delete_keys(self, *keys):
+        keys = [key for key in keys if key]
+        if not keys:
+            return
+        if self.client:
+            self.client.delete(*keys)
+            return
+        for key in keys:
+            self.rest_command("DEL", key)
+
+    def keys(self, pattern):
+        if self.client:
+            return self.client.keys(pattern)
+        return self.rest_command("KEYS", pattern) or []
+
+    def list_range(self, key, start=0, end=-1):
+        if self.client:
+            return self.client.lrange(key, start, end)
+        return self.rest_command("LRANGE", key, start, end) or []
+
+    def list_push(self, key, value):
+        if self.client:
+            self.client.rpush(key, value)
+            return
+        self.rest_command("RPUSH", key, value)
+
+    def acquire_lock(self, name, timeout=5):
+        lock_key = f"{REDIS_KEY_PREFIX}:lock:{name}"
+        token = secrets.token_hex(16)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.client:
+                acquired = self.client.set(lock_key, token, nx=True, ex=timeout)
+            else:
+                acquired = self.rest_command("SET", lock_key, token, "NX", "EX", timeout) == "OK"
+            if acquired:
+                return lock_key
+            time.sleep(0.05)
+        raise RuntimeError("Timed out waiting for Redis lock.")
+
+    def release_lock(self, lock_key):
+        self.delete_keys(lock_key)
+
+    def load_votes(self):
+        votes = {}
+        for key in self.keys(self.vote_pattern()):
+            raw = self.get_text(key)
+            if not raw:
+                continue
+            try:
+                record = json.loads(raw)
+            except Exception:
+                continue
+            voter_id = key.rsplit(":vote:", 1)[-1]
+            votes[voter_id] = record
+
+        raw = self.get_text(self.key(VOTES_FILE))
+        if not raw:
+            return votes
+        try:
+            legacy_votes = json.loads(raw)
+        except Exception:
+            return votes
+        if isinstance(legacy_votes, dict):
+            merged = dict(legacy_votes)
+            merged.update(votes)
+            return merged
+        return votes
+
+    def save_votes(self, votes):
+        existing = self.keys(self.vote_pattern())
+        self.delete_keys(*existing, self.key(VOTES_FILE))
+        for voter_id, record in (votes or {}).items():
+            self.set_text(self.vote_key(voter_id), json.dumps(record, indent=2))
+
+    def has_vote(self, voter_id):
+        return self.get_text(self.vote_key(voter_id)) is not None or voter_id in self.load_votes()
+
+    def record_vote(self, voter_id, vote_record):
+        raw_legacy_votes = self.get_text(self.key(VOTES_FILE))
+        if raw_legacy_votes:
+            try:
+                legacy_votes = json.loads(raw_legacy_votes)
+            except Exception:
+                legacy_votes = {}
+            if isinstance(legacy_votes, dict) and voter_id in legacy_votes:
+                return False
+
+        saved = self.set_text_nx(self.vote_key(voter_id), json.dumps(vote_record, indent=2))
+        if saved:
+            return True
+        return False
 
     def rest_command(self, *parts):
         payload = json.dumps(list(parts)).encode("utf-8")
@@ -116,6 +231,9 @@ REDIS_STORE = RedisStore()
 
 def load_json(file_path, default):
     if REDIS_STORE.enabled:
+        if Path(file_path).name == "votes.json":
+            return REDIS_STORE.load_votes()
+
         raw = REDIS_STORE.get_text(REDIS_STORE.key(file_path))
         if raw in (None, ""):
             REDIS_STORE.set_text(REDIS_STORE.key(file_path), json.dumps(default))
@@ -137,6 +255,10 @@ def load_json(file_path, default):
 
 def save_json(file_path, data):
     if REDIS_STORE.enabled:
+        if Path(file_path).name == "votes.json":
+            REDIS_STORE.save_votes(data)
+            return
+
         REDIS_STORE.set_text(REDIS_STORE.key(file_path), json.dumps(data, indent=2))
         return
 
@@ -212,14 +334,19 @@ def normalize_imported_candidates(raw_candidates):
 
 def read_audit_entries():
     if REDIS_STORE.enabled:
-        raw = REDIS_STORE.get_text(REDIS_STORE.key(AUDIT_LOG_FILE))
-        if not raw:
-            return []
         entries = []
-        for line in raw.splitlines():
-            line = line.strip()
-            if line:
-                entries.append(json.loads(line))
+        for raw_entry in REDIS_STORE.list_range(REDIS_STORE.audit_list_key(), 0, -1):
+            if raw_entry:
+                entries.append(json.loads(raw_entry))
+        if entries:
+            return entries
+
+        raw = REDIS_STORE.get_text(REDIS_STORE.key(AUDIT_LOG_FILE))
+        if raw:
+            for line in raw.splitlines():
+                line = line.strip()
+                if line:
+                    entries.append(json.loads(line))
         return entries
 
     if not AUDIT_LOG_FILE.exists():
@@ -239,27 +366,45 @@ def audit_entry_hash(entry):
     return sha256_text(canonical_json(unsigned))
 
 def append_audit_event(action, actor="system", details=None, candidates=None, votes=None):
-    entries = read_audit_entries()
-    prev_hash = entries[-1]["hash"] if entries else "GENESIS"
-    entry = {
-        "index": len(entries) + 1,
-        "timestamp": datetime.now().isoformat() + "Z",
-        "action": action,
-        "actor": actor,
-        "details": details or {},
-        "resultsHash": compute_results_hash(candidates, votes),
-        "prevHash": prev_hash
-    }
-    entry["hash"] = audit_entry_hash(entry)
+    lock_key = None
     if REDIS_STORE.enabled:
-        audit_key = REDIS_STORE.key(AUDIT_LOG_FILE)
-        current = REDIS_STORE.get_text(audit_key) or ""
-        REDIS_STORE.set_text(audit_key, current + canonical_json(entry) + "\n")
-        return entry
+        lock_key = REDIS_STORE.acquire_lock("audit", timeout=20)
 
-    with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(canonical_json(entry) + "\n")
-    return entry
+    try:
+        if REDIS_STORE.enabled:
+            last_index = REDIS_STORE.get_text(REDIS_STORE.audit_index_key())
+            prev_hash = REDIS_STORE.get_text(REDIS_STORE.audit_hash_key())
+            if last_index is None or prev_hash is None:
+                entries = read_audit_entries()
+                last_index = str(len(entries))
+                prev_hash = entries[-1]["hash"] if entries else "GENESIS"
+        else:
+            entries = read_audit_entries()
+            last_index = str(len(entries))
+            prev_hash = entries[-1]["hash"] if entries else "GENESIS"
+
+        entry = {
+            "index": int(last_index) + 1,
+            "timestamp": datetime.now().isoformat() + "Z",
+            "action": action,
+            "actor": actor,
+            "details": details or {},
+            "resultsHash": compute_results_hash(candidates, votes),
+            "prevHash": prev_hash
+        }
+        entry["hash"] = audit_entry_hash(entry)
+        if REDIS_STORE.enabled:
+            REDIS_STORE.list_push(REDIS_STORE.audit_list_key(), canonical_json(entry))
+            REDIS_STORE.set_text(REDIS_STORE.audit_index_key(), str(entry["index"]))
+            REDIS_STORE.set_text(REDIS_STORE.audit_hash_key(), entry["hash"])
+            return entry
+
+        with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(canonical_json(entry) + "\n")
+        return entry
+    finally:
+        if lock_key:
+            REDIS_STORE.release_lock(lock_key)
 
 def verify_audit_log():
     if REDIS_STORE.enabled:
@@ -470,8 +615,8 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not voter_id:
                 self.send_error_json("Missing voterId", 400)
                 return
-            votes_ledger = load_json(VOTES_FILE, {})
-            self.send_json({"voted": voter_id in votes_ledger})
+            voted = REDIS_STORE.has_vote(voter_id) if REDIS_STORE.enabled else voter_id in load_json(VOTES_FILE, {})
+            self.send_json({"voted": voted})
             return
 
         if path == "/api/admin/results":
@@ -559,14 +704,6 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
 
             voter_id = f"{election_scope}_{role_no}"
-            
-            votes_ledger = load_json(VOTES_FILE, {})
-            if voter_id in votes_ledger:
-                append_audit_event("duplicate_vote_blocked", "voter", {
-                    "voterId": voter_id
-                }, votes=votes_ledger)
-                self.send_error_json("This Roll No. has already voted.", 403)
-                return
 
             vote_record = {
                 "voterName": voter_name,
@@ -576,8 +713,26 @@ class AppHandler(SimpleHTTPRequestHandler):
                 "votes": v_votes,
                 "timestamp": int(uuid.uuid1().time / 10)
             }
-            votes_ledger[voter_id] = vote_record
-            save_json(VOTES_FILE, votes_ledger)
+
+            if REDIS_STORE.enabled:
+                if not REDIS_STORE.record_vote(voter_id, vote_record):
+                    append_audit_event("duplicate_vote_blocked", "voter", {
+                        "voterId": voter_id
+                    })
+                    self.send_error_json("This Roll No. has already voted.", 403)
+                    return
+                votes_ledger = load_json(VOTES_FILE, {})
+            else:
+                votes_ledger = load_json(VOTES_FILE, {})
+                if voter_id in votes_ledger:
+                    append_audit_event("duplicate_vote_blocked", "voter", {
+                        "voterId": voter_id
+                    }, votes=votes_ledger)
+                    self.send_error_json("This Roll No. has already voted.", 403)
+                    return
+                votes_ledger[voter_id] = vote_record
+                save_json(VOTES_FILE, votes_ledger)
+
             append_audit_event("vote_submitted", "voter", {
                 "voterId": voter_id,
                 "ballotHash": sha256_text(canonical_json(vote_record))
