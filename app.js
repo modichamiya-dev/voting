@@ -7,6 +7,8 @@ const ROLES = [
   { id: 'assistant_head_girl',     label: 'Assistant Head Girl',     gender: 'girl', icon: 'AG' },
   { id: 'sports_captain_boy',      label: 'Sports Captain Boy',      gender: 'boy',  icon: 'SB' },
   { id: 'sports_captain_girl',     label: 'Sports Captain Girl',     gender: 'girl', icon: 'SG' },
+  { id: 'vice_sports_captain_boy', label: 'Vice Sports Captain Boy', gender: 'boy',  icon: 'VB' },
+  { id: 'vice_sports_captain_girl',label: 'Vice Sports Captain Girl',gender: 'girl', icon: 'VG' },
   { id: 'cultural_secretary_boy',  label: 'Cultural Secretary Boy',  gender: 'boy',  icon: 'CB' },
   { id: 'cultural_secretary_girl', label: 'Cultural Secretary Girl', gender: 'girl', icon: 'CG' },
 ];
