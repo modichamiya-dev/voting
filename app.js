@@ -17,8 +17,6 @@ const ROLES = [
 let state = {
   page: 'home',        // home | vote | success | results | admin | login
   voterName: '',
-  voterSection: '',
-  voterRoleNo: '',
   votes: {},           // { roleId: candidateId }
   adminLoggedIn: !!sessionStorage.getItem('hce_token'),
   adminToken: sessionStorage.getItem('hce_token') || '',
@@ -137,21 +135,13 @@ function buildHome() {
   return `
   <section class="hero" style="padding-top: 40px; padding-bottom: 20px;">
     <h1 class="hero-title">Voter Registration</h1>
-    <p class="hero-subtitle">Enter your student details to begin voting.</p>
+    <p class="hero-subtitle">Enter your name to begin voting.</p>
   </section>
   <div class="registration-container">
     <div class="registration-card">
       <div class="form-group-premium">
         <label class="form-label-premium">Name</label>
         <input class="form-input-premium" id="voter-name-input" placeholder="Your full name" />
-      </div>
-      <div class="form-group-premium">
-        <label class="form-label-premium">Class & Section</label>
-        <input class="form-input-premium" id="voter-section-input" placeholder="e.g. 10-A, 12-B" />
-      </div>
-      <div class="form-group-premium">
-        <label class="form-label-premium">Roll Number</label>
-        <input class="form-input-premium" id="voter-roleno-input" placeholder="e.g. 25" />
       </div>
       
       <div id="voter-error" class="voter-error-message" style="display:none"></div>
@@ -162,47 +152,22 @@ function buildHome() {
 
 async function proceedToVote() {
   const name = document.getElementById('voter-name-input').value.trim();
-  const section = document.getElementById('voter-section-input').value.trim();
-  const roleNo = document.getElementById('voter-roleno-input').value.trim();
   const errEl = document.getElementById('voter-error');
 
-  if (!name || !section || !roleNo) {
-    errEl.textContent = 'Please fill in all fields.';
+  if (!name) {
+    errEl.textContent = 'Please enter your name.';
     errEl.style.display = 'block';
     return;
   }
 
-  const voterId = `${ELECTION_SCOPE}_${roleNo}`;
-  const submitBtn = document.querySelector('.btn-primary-premium');
-  
-  if (submitBtn) {
-    submitBtn.disabled = true;
-    submitBtn.textContent = 'Verifying details...';
-  }
-
-  try {
-    const check = await apiCall(`/api/check-voted?voterId=${encodeURIComponent(voterId)}`);
-    if (check.voted) {
-      errEl.textContent = 'This Roll No. has already voted.';
-      errEl.style.display = 'block';
-      if (submitBtn) {
-        submitBtn.disabled = false;
-        submitBtn.textContent = 'Continue to Vote';
-      }
-      return;
-    }
-  } catch (err) {
-    if (submitBtn) {
-      submitBtn.disabled = false;
-      submitBtn.textContent = 'Continue to Vote';
-    }
+  if (!/^[A-Za-z ]+$/.test(name)) {
+    errEl.textContent = 'Name can contain alphabets and spaces only.';
+    errEl.style.display = 'block';
     return;
   }
 
   state.voterName = name;
-  state.voterSection = section;
-  state.voterRoleNo = roleNo;
-  state.currentVoterId = voterId;
+  state.currentVoterId = null;
   state.votes = {};
   state.page = 'vote';
   render();
@@ -224,14 +189,6 @@ function buildVote() {
       <div class="voter-info-item">
         <span class="voter-info-label">Voter:</span>
         <span class="voter-info-val">${esc(state.voterName)}</span>
-      </div>
-      <div class="voter-info-item" style="margin-left:auto">
-        <span class="voter-info-label">Section:</span>
-        <span class="voter-info-badge">${esc(state.voterSection)}</span>
-      </div>
-      <div class="voter-info-item">
-        <span class="voter-info-label">Roll No:</span>
-        <span class="voter-info-val">${esc(state.voterRoleNo)}</span>
       </div>
     </div>
 
@@ -331,8 +288,6 @@ async function submitVotes() {
   try {
     await apiCall('/api/vote', 'POST', {
       voterName: state.voterName,
-      section: state.voterSection,
-      roleNo: state.voterRoleNo,
       house: ELECTION_SCOPE,
       votes: state.votes
     });
@@ -1094,16 +1049,14 @@ function adminLogout() {
 // ─── EXPORT RESULTS ───────────────────────────────────────
 function exportToCSV() {
   let csvContent = "data:text/csv;charset=utf-8,";
-  csvContent += "Voter Name,Class & Section,Roll Number,Category,Voted Candidate\n";
+  csvContent += "Voter Name,Category,Voted Candidate\n";
 
   Object.values(state.voteLedger).forEach(v => {
     Object.entries(v.votes || {}).forEach(([roleId, candidateId]) => {
       const roleLabel = ROLES.find(r => r.id === roleId)?.label || roleId;
       const candidateName = state.candidates[candidateId]?.name || 'Unknown';
       const row = [
-        `"${v.voterName.replace(/"/g, '""')}"`,
-        `"${v.section.replace(/"/g, '""')}"`,
-        `"${v.roleNo.replace(/"/g, '""')}"`,
+        `"${(v.voterName || '').replace(/"/g, '""')}"`,
         `"${roleLabel}"`,
         `"${candidateName.replace(/"/g, '""')}"`
       ].join(",");
