@@ -6,6 +6,7 @@ import threading
 import hashlib
 import urllib.request
 import time
+import re
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -465,8 +466,9 @@ def verify_audit_log():
     }
 
 sessions = set()
+NAME_PATTERN = re.compile(r"^[A-Za-z ]+$")
 
-def send_discord_webhook(voter_name, section, role_no, election_scope, votes_dict):
+def send_discord_webhook(voter_name, ballot_id, election_scope, votes_dict):
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
     if not webhook_url:
         return
@@ -532,7 +534,7 @@ def send_discord_webhook(voter_name, section, role_no, election_scope, votes_dic
         "fields": [
             {
                 "name": "👤 Voter Details",
-                "value": f"**Name:** {voter_name}\n**Class & Section:** {section}\n**Roll No:** {role_no}\n**Election:** Cabinet",
+                "value": f"**Name:** {voter_name}\n**Ballot ID:** `{ballot_id}`\n**Election:** Cabinet",
                 "inline": True
             },
             {
@@ -694,42 +696,43 @@ class AppHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/vote":
             voter_name = data.get("voterName", "").strip()
-            section = data.get("section", "").strip()
-            role_no = data.get("roleNo", "").strip()
             election_scope = data.get("house", "cabinet").strip() or "cabinet"
             v_votes = data.get("votes", {})
 
-            if not voter_name or not section or not role_no or not v_votes:
+            if not voter_name or not v_votes:
                 self.send_error_json("Missing required fields", 400)
                 return
 
-            voter_id = f"{election_scope}_{role_no}"
-
-            vote_record = {
-                "voterName": voter_name,
-                "house": election_scope,
-                "section": section,
-                "roleNo": role_no,
-                "votes": v_votes,
-                "timestamp": int(uuid.uuid1().time / 10)
-            }
+            if not NAME_PATTERN.fullmatch(voter_name):
+                self.send_error_json("Name can contain alphabets and spaces only.", 400)
+                return
 
             if REDIS_STORE.enabled:
-                if not REDIS_STORE.record_vote(voter_id, vote_record):
-                    append_audit_event("duplicate_vote_blocked", "voter", {
-                        "voterId": voter_id
-                    })
-                    self.send_error_json("This Roll No. has already voted.", 403)
+                for _ in range(5):
+                    voter_id = f"{election_scope}_{secrets.token_hex(12)}"
+                    vote_record = {
+                        "id": voter_id,
+                        "voterName": voter_name,
+                        "house": election_scope,
+                        "votes": v_votes,
+                        "timestamp": int(uuid.uuid1().time / 10)
+                    }
+                    if REDIS_STORE.record_vote(voter_id, vote_record):
+                        break
+                else:
+                    self.send_error_json("Could not create ballot. Please try again.", 500)
                     return
                 votes_ledger = load_json(VOTES_FILE, {})
             else:
+                voter_id = f"{election_scope}_{secrets.token_hex(12)}"
+                vote_record = {
+                    "id": voter_id,
+                    "voterName": voter_name,
+                    "house": election_scope,
+                    "votes": v_votes,
+                    "timestamp": int(uuid.uuid1().time / 10)
+                }
                 votes_ledger = load_json(VOTES_FILE, {})
-                if voter_id in votes_ledger:
-                    append_audit_event("duplicate_vote_blocked", "voter", {
-                        "voterId": voter_id
-                    }, votes=votes_ledger)
-                    self.send_error_json("This Roll No. has already voted.", 403)
-                    return
                 votes_ledger[voter_id] = vote_record
                 save_json(VOTES_FILE, votes_ledger)
 
@@ -741,7 +744,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             if os.environ.get("DISCORD_WEBHOOK_URL"):
                 threading.Thread(
                     target=send_discord_webhook,
-                    args=(voter_name, section, role_no, election_scope, v_votes),
+                    args=(voter_name, voter_id, election_scope, v_votes),
                     daemon=True
                 ).start()
 
